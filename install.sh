@@ -699,8 +699,6 @@ enable_global_proxy() {
 }
 
 show_result() {
-    local current_ip=$(/usr/local/bin/warp ip 2>/dev/null | grep "当前出站" | awk -F': ' '{print $2}' | sed 's/\x1b\[[0-9;]*m//g')
-    
     echo ""
     echo -e "${GREEN}════════════════════════════════════════${NC}"
     echo -e "${GREEN}         安装完成！${NC}"
@@ -708,9 +706,32 @@ show_result() {
     echo ""
     echo -e "全局代理已自动开启"
     echo ""
-    echo -e "当前出站 IP: ${GREEN}${current_ip:-获取中...}${NC}"
+    echo -e "当前出站 IP: ${GREEN}$(curl -4 -s --max-time 10 ifconfig.me --proxy socks5://127.0.0.1:$PROXY_PORT 2>/dev/null || echo '获取中...')${NC}"
     echo ""
     echo -e "输入 ${YELLOW}warp${NC} 查看命令菜单"
     echo ""
     echo -e "${BLUE}常用命令:${NC}"
-    echo -e "  ${YELLOW}warp on
+    echo -e "  ${YELLOW}warp on${NC}      - 开启全局代理"
+    echo -e "  ${YELLOW}warp off${NC}     - 关闭全局代理"
+    echo -e "  ${YELLOW}warp ip${NC}      - 查看当前 IP"
+    echo -e "  ${YELLOW}warp change${NC}  - 更换 IP"
+    echo -e "  ${YELLOW}warp account${NC} - 设置 WARP+"
+    echo ""
+}
+
+main() {
+    check_root
+    detect_network
+    setup_ipv4_priority
+    install_dependencies
+    install_warp_cli
+    install_tun2socks
+    configure_warp
+    create_tun2socks_service
+    save_network_info
+    install_warp_command
+    enable_global_proxy
+    show_result
+}
+
+main
