@@ -1,6 +1,8 @@
 #!/bin/bash
 #===============================================
-# WARP-CLI 一键安装脚本（支持 IPv4/IPv6 全局代理）
+# WARP-CLI 一键安装脚本
+# 支持 IPv4 VPS 和 纯 IPv6 VPS
+# 自动检测环境，自动配置全局代理
 #===============================================
 
 RED='\033[0;31m'
@@ -10,7 +12,9 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 PROXY_PORT=40000
-TUN_NAME="warp0"
+REDIR_PORT=12345
+CONFIG_FILE="/etc/warp-cli-config"
+NETWORK_FILE="/etc/warp-network.conf"
 
 log_info() { echo -e "${BLUE}[信息]${NC} $1"; }
 log_success() { echo -e "${GREEN}[成功]${NC} $1"; }
@@ -29,10 +33,12 @@ detect_network() {
     
     HAS_IPV4=false
     HAS_IPV6=false
+    IS_PURE_IPV6=false
     
     if curl -4 -s --max-time 5 ifconfig.me &>/dev/null; then
         HAS_IPV4=true
-        log_success "检测到 IPv4 网络"
+        VPS_IP=$(curl -4 -s --max-time 5 ifconfig.me)
+        log_success "检测到 IPv4: $VPS_IP"
     fi
     
     if curl -6 -s --max-time 5 ifconfig.me &>/dev/null; then
@@ -46,8 +52,10 @@ detect_network() {
     fi
     
     if ! $HAS_IPV4 && $HAS_IPV6; then
-        log_warn "检测到纯 IPv6 环境"
+        IS_PURE_IPV6=true
+        log_warn "检测到纯 IPv6 环境，将使用特殊配置"
         setup_github_hosts
+        setup_ipv6_dns
     fi
 }
 
@@ -63,10 +71,23 @@ setup_github_hosts() {
 2a01:4f8:c010:d56::6 ghcr.io
 2a01:4f8:c010:d56::7 pkg.github.com npm.pkg.github.com maven.pkg.github.com nuget.pkg.github.com rubygems.pkg.github.com
 2a01:4f8:c010:d56::8 uploads.github.com
-2606:50c0:8000::133 objects.githubusercontent.com raw.githubusercontent.com
+2606:50c0:8000::133 objects.githubusercontent.com raw.githubusercontent.com gist.githubusercontent.com cloud.githubusercontent.com
 2606:50c0:8000::154 github.githubassets.com
 EOF
         log_success "GitHub Hosts 已添加"
+    fi
+}
+
+setup_ipv6_dns() {
+    log_info "配置 IPv6 DNS..."
+    
+    if ! grep -q "2001:4860:4860::8888" /etc/resolv.conf; then
+        cp /etc/resolv.conf /etc/resolv.conf.bak.warp 2>/dev/null
+        cat > /etc/resolv.conf << 'EOF'
+nameserver 2001:4860:4860::8888
+nameserver 2606:4700:4700::1111
+EOF
+        log_success "IPv6 DNS 已配置"
     fi
 }
 
@@ -118,11 +139,53 @@ install_tun2socks() {
     cd /tmp
     curl -L -o tun2socks.zip "$TUN2SOCKS_URL"
     unzip -o tun2socks.zip
-    mv tun2socks-linux-* /usr/local/bin/tun2socks 2>/dev/null || mv tun2socks /usr/local/bin/tun2socks
+    mv tun2socks-linux-* /usr/local/bin/tun2socks 2>/dev/null || mv tun2socks /usr/local/bin/tun2socks 2>/dev/null
     chmod +x /usr/local/bin/tun2socks
     rm -f tun2socks.zip
     
+    cat > /etc/systemd/system/tun2socks.service << EOF
+[Unit]
+Description=tun2socks
+After=network.target warp-svc.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/tun2socks -device warp0 -proxy socks5://127.0.0.1:$PROXY_PORT
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    
+    systemctl daemon-reload
     log_success "tun2socks 安装完成"
+}
+
+install_redsocks() {
+    log_info "安装 redsocks..."
+    apt install -y redsocks
+    
+    cat > /etc/redsocks.conf << EOF
+base {
+    log_debug = off;
+    log_info = off;
+    daemon = on;
+    redirector = iptables;
+}
+redsocks {
+    local_ip = 127.0.0.1;
+    local_port = $REDIR_PORT;
+    ip = 127.0.0.1;
+    port = $PROXY_PORT;
+    type = socks5;
+}
+EOF
+    
+    systemctl disable redsocks 2>/dev/null
+    systemctl stop redsocks 2>/dev/null
+    
+    log_success "redsocks 安装完成"
 }
 
 configure_warp() {
@@ -151,44 +214,21 @@ configure_warp() {
     log_warn "WARP 连接状态未知，继续安装..."
 }
 
-create_tun2socks_service() {
-    log_info "创建 tun2socks 服务..."
-    
-    cat > /etc/systemd/system/tun2socks.service << EOF
-[Unit]
-Description=tun2socks
-After=network.target warp-svc.service
-Wants=warp-svc.service
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/tun2socks -device $TUN_NAME -proxy socks5://127.0.0.1:$PROXY_PORT
-Restart=always
-RestartSec=3
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    systemctl daemon-reload
-    log_success "tun2socks 服务已创建"
-}
-
 save_network_info() {
     local iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
     local gateway=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
-    local vps_ip=""
+    local gateway6=$(ip -6 route show default 2>/dev/null | awk '/default/ {print $3; exit}')
+    local iface6=$(ip -6 route show default 2>/dev/null | awk '/default/ {print $5; exit}')
     
-    if $HAS_IPV4; then
-        vps_ip=$(curl -4 -s --max-time 5 ifconfig.me 2>/dev/null)
-    fi
-    
-    cat > /etc/warp-network.conf << EOF
+    cat > "$NETWORK_FILE" << EOF
 DEFAULT_IFACE="$iface"
 DEFAULT_GATEWAY="$gateway"
-VPS_IP="$vps_ip"
+DEFAULT_IFACE6="$iface6"
+DEFAULT_GATEWAY6="$gateway6"
+VPS_IP="$VPS_IP"
 HAS_IPV4=$HAS_IPV4
 HAS_IPV6=$HAS_IPV6
+IS_PURE_IPV6=$IS_PURE_IPV6
 EOF
     
     log_success "网络信息已保存"
@@ -201,6 +241,7 @@ install_warp_command() {
 #!/bin/bash
 
 PROXY_PORT=40000
+REDIR_PORT=12345
 TUN_NAME="warp0"
 CONFIG_FILE="/etc/warp-cli-config"
 NETWORK_FILE="/etc/warp-network.conf"
@@ -219,41 +260,29 @@ load_config() {
 }
 
 save_config() { 
+    local tmp=$(grep -v "WARP_PLUS_KEY" "$CONFIG_FILE" 2>/dev/null)
     echo "WARP_PLUS_KEY=\"$WARP_PLUS_KEY\"" > "$CONFIG_FILE"
 }
 
 is_global_active() {
-    [[ -f "$GLOBAL_MARK" ]] && ip link show $TUN_NAME &>/dev/null
+    [[ -f "$GLOBAL_MARK" ]]
 }
 
 get_current_ip() {
-    local ip=""
-    ip=$(curl -4 -s --max-time 10 ifconfig.me --proxy socks5://127.0.0.1:$PROXY_PORT 2>/dev/null)
-    if [[ -z "$ip" ]]; then
-        ip=$(curl -s --max-time 10 ifconfig.me 2>/dev/null)
-    fi
-    echo "$ip"
+    curl -4 -s --max-time 10 ifconfig.me 2>/dev/null
 }
 
-setup_global_proxy() {
-    load_config
-    
+# ============ IPv4 VPS: tun2socks 方案 ============
+setup_tun2socks() {
     systemctl start tun2socks
     sleep 2
     
     local retry=0
     while [[ $retry -lt 10 ]]; do
-        if ip link show $TUN_NAME &>/dev/null; then
-            break
-        fi
+        ip link show $TUN_NAME &>/dev/null && break
         retry=$((retry + 1))
         sleep 1
     done
-    
-    if ! ip link show $TUN_NAME &>/dev/null; then
-        echo -e "${R}TUN 设备创建失败${N}"
-        return 1
-    fi
     
     ip addr add 10.0.0.1/24 dev $TUN_NAME 2>/dev/null
     ip link set $TUN_NAME up
@@ -261,13 +290,8 @@ setup_global_proxy() {
     local gateway="$DEFAULT_GATEWAY"
     local iface="$DEFAULT_IFACE"
     
-    if [[ -z "$gateway" ]] || [[ -z "$iface" ]]; then
-        gateway=$(ip route show default | awk '/default/ {print $3; exit}')
-        iface=$(ip route show default | awk '/default/ {print $5; exit}')
-    fi
-    
-    # 保存原始路由
-    ip route show default > /tmp/warp_original_route 2>/dev/null
+    [[ -z "$gateway" ]] && gateway=$(ip route show default | awk '/default/ {print $3; exit}')
+    [[ -z "$iface" ]] && iface=$(ip route show default | awk '/default/ {print $5; exit}')
     
     # WARP 端点走原始网关
     for net in 162.159.192.0/24 162.159.193.0/24 162.159.195.0/24 162.159.204.0/24 \
@@ -275,14 +299,11 @@ setup_global_proxy() {
         ip route add $net via $gateway dev $iface 2>/dev/null
     done
     
-    # VPS IP 走原始网关
     [[ -n "$VPS_IP" ]] && ip route add $VPS_IP via $gateway dev $iface 2>/dev/null
     
-    # SSH 客户端走原始网关
     local ssh_client=$(echo $SSH_CLIENT | awk '{print $1}')
     [[ -n "$ssh_client" ]] && ip route add $ssh_client via $gateway dev $iface 2>/dev/null
     
-    # 设置默认路由走 TUN
     ip route del default 2>/dev/null
     ip route add default dev $TUN_NAME metric 1
     ip route add default via $gateway dev $iface metric 100 2>/dev/null
@@ -290,9 +311,7 @@ setup_global_proxy() {
     touch "$GLOBAL_MARK"
 }
 
-clear_global_proxy() {
-    load_config
-    
+clear_tun2socks() {
     systemctl stop tun2socks 2>/dev/null
     
     local gateway="$DEFAULT_GATEWAY"
@@ -311,19 +330,69 @@ clear_global_proxy() {
     done
     
     ip link del $TUN_NAME 2>/dev/null
+    rm -f "$GLOBAL_MARK"
+}
+
+# ============ 纯 IPv6 VPS: redsocks 方案 ============
+setup_redsocks() {
+    # 添加虚拟 IPv4
+    ip addr add 10.0.0.1/8 dev lo 2>/dev/null
+    ip route add default via 10.0.0.1 dev lo 2>/dev/null || ip route add default dev lo 2>/dev/null
+    
+    # 启动 redsocks
+    pkill redsocks 2>/dev/null
+    sleep 1
+    redsocks -c /etc/redsocks.conf
+    sleep 1
+    
+    # 配置 iptables
+    iptables -t nat -F WARP_REDIRECT 2>/dev/null
+    iptables -t nat -X WARP_REDIRECT 2>/dev/null
+    iptables -t nat -N WARP_REDIRECT 2>/dev/null
+    
+    iptables -t nat -A WARP_REDIRECT -d 10.0.0.0/8 -j RETURN
+    iptables -t nat -A WARP_REDIRECT -d 127.0.0.0/8 -j RETURN
+    iptables -t nat -A WARP_REDIRECT -d 172.16.0.0/12 -j RETURN
+    iptables -t nat -A WARP_REDIRECT -d 192.168.0.0/16 -j RETURN
+    iptables -t nat -A WARP_REDIRECT -d 162.159.36.1 -j RETURN
+    iptables -t nat -A WARP_REDIRECT -d 162.159.46.1 -j RETURN
+    iptables -t nat -A WARP_REDIRECT -p tcp -j REDIRECT --to-ports $REDIR_PORT
+    
+    iptables -t nat -D OUTPUT -p tcp -j WARP_REDIRECT 2>/dev/null
+    iptables -t nat -A OUTPUT -p tcp -j WARP_REDIRECT
+    
+    touch "$GLOBAL_MARK"
+}
+
+clear_redsocks() {
+    iptables -t nat -D OUTPUT -p tcp -j WARP_REDIRECT 2>/dev/null
+    iptables -t nat -F WARP_REDIRECT 2>/dev/null
+    iptables -t nat -X WARP_REDIRECT 2>/dev/null
+    
+    pkill redsocks 2>/dev/null
+    
+    ip route del default via 10.0.0.1 2>/dev/null
+    ip route del default dev lo 2>/dev/null
+    ip addr del 10.0.0.1/8 dev lo 2>/dev/null
     
     rm -f "$GLOBAL_MARK"
 }
 
+# ============ 通用函数 ============
 menu() {
+    load_config
     local status="${R}关闭${N}"
     is_global_active && status="${G}开启${N}"
+    
+    local env_type="IPv4"
+    [[ "$IS_PURE_IPV6" == "true" ]] && env_type="纯IPv6"
     
     echo ""
     echo -e "${C}╔══════════════════════════════════════════╗${N}"
     echo -e "${C}║${N}        ${G}WARP 全局代理管理${N}                ${C}║${N}"
     echo -e "${C}╠══════════════════════════════════════════╣${N}"
-    echo -e "${C}║${N}  全局代理状态: $status                       ${C}║${N}"
+    echo -e "${C}║${N}  环境类型: ${G}$env_type${N}                        ${C}║${N}"
+    echo -e "${C}║${N}  全局代理: $status                            ${C}║${N}"
     echo -e "${C}╠══════════════════════════════════════════╣${N}"
     echo -e "${C}║${N}  ${Y}warp on${N}           开启全局代理          ${C}║${N}"
     echo -e "${C}║${N}  ${Y}warp off${N}          关闭全局代理          ${C}║${N}"
@@ -339,48 +408,83 @@ menu() {
 }
 
 warp_on() {
+    load_config
     echo -e "${Y}正在开启全局代理...${N}"
+    
     warp-cli connect 2>/dev/null
     sleep 2
-    setup_global_proxy
+    
+    if [[ "$IS_PURE_IPV6" == "true" ]]; then
+        setup_redsocks
+    else
+        setup_tun2socks
+    fi
+    
     sleep 2
     echo -e "${G}✓ 全局代理已开启${N}"
     echo -e "当前出站 IP: ${G}$(get_current_ip)${N}"
 }
 
 warp_off() {
+    load_config
     echo -e "${Y}正在关闭全局代理...${N}"
-    clear_global_proxy
+    
+    if [[ "$IS_PURE_IPV6" == "true" ]]; then
+        clear_redsocks
+    else
+        clear_tun2socks
+    fi
+    
     sleep 2
     echo -e "${G}✓ 全局代理已关闭${N}"
-    local ip=$(curl -s --max-time 10 ifconfig.me 2>/dev/null)
-    echo -e "当前出站 IP: ${G}${ip:-获取中...}${N}"
 }
 
 warp_proxy() {
+    load_config
     echo -e "${Y}切换到仅代理模式...${N}"
-    clear_global_proxy
+    
+    if [[ "$IS_PURE_IPV6" == "true" ]]; then
+        clear_redsocks
+    else
+        clear_tun2socks
+    fi
+    
     warp-cli connect 2>/dev/null
+    
     echo -e "${G}✓ 已切换到仅代理模式${N}"
     echo -e "代理地址: ${G}socks5://127.0.0.1:$PROXY_PORT${N}"
     echo -e "代理 IP: ${G}$(curl -4 -s --max-time 10 ifconfig.me --proxy socks5://127.0.0.1:$PROXY_PORT 2>/dev/null)${N}"
 }
 
 warp_change() {
+    load_config
     echo -e "${Y}正在更换 IP...${N}"
     local old_ip=$(get_current_ip)
     
     local was_active=false
     is_global_active && was_active=true
     
-    $was_active && clear_global_proxy
+    if $was_active; then
+        if [[ "$IS_PURE_IPV6" == "true" ]]; then
+            clear_redsocks
+        else
+            clear_tun2socks
+        fi
+    fi
     
     warp-cli disconnect 2>/dev/null
     sleep 1
     warp-cli connect 2>/dev/null
     sleep 3
     
-    $was_active && setup_global_proxy && sleep 2
+    if $was_active; then
+        if [[ "$IS_PURE_IPV6" == "true" ]]; then
+            setup_redsocks
+        else
+            setup_tun2socks
+        fi
+        sleep 2
+    fi
     
     local new_ip=$(get_current_ip)
     echo -e "旧 IP: ${Y}$old_ip${N}"
@@ -395,7 +499,13 @@ warp_change_full() {
     local was_active=false
     is_global_active && was_active=true
     
-    $was_active && clear_global_proxy
+    if $was_active; then
+        if [[ "$IS_PURE_IPV6" == "true" ]]; then
+            clear_redsocks
+        else
+            clear_tun2socks
+        fi
+    fi
     
     warp-cli disconnect 2>/dev/null
     warp-cli registration delete 2>/dev/null
@@ -412,7 +522,14 @@ warp_change_full() {
     warp-cli connect
     sleep 3
     
-    $was_active && setup_global_proxy && sleep 2
+    if $was_active; then
+        if [[ "$IS_PURE_IPV6" == "true" ]]; then
+            setup_redsocks
+        else
+            setup_tun2socks
+        fi
+        sleep 2
+    fi
     
     local new_ip=$(get_current_ip)
     echo -e "旧 IP: ${Y}$old_ip${N}"
@@ -420,20 +537,28 @@ warp_change_full() {
 }
 
 warp_status() {
+    load_config
     echo -e "${B}══════════ WARP 状态 ══════════${N}"
     warp-cli status
     echo ""
+    
     echo -e "${B}══════════ 全局代理 ══════════${N}"
     if is_global_active; then
         echo -e "状态: ${G}已开启${N}"
-        echo -e "TUN 设备: ${G}$TUN_NAME${N}"
+        [[ "$IS_PURE_IPV6" == "true" ]] && echo -e "模式: ${G}redsocks${N}" || echo -e "模式: ${G}tun2socks${N}"
     else
         echo -e "状态: ${Y}已关闭${N}"
     fi
     echo ""
+    
+    echo -e "${B}══════════ 环境信息 ══════════${N}"
+    [[ "$IS_PURE_IPV6" == "true" ]] && echo -e "类型: ${Y}纯 IPv6${N}" || echo -e "类型: ${G}IPv4${N}"
+    echo ""
+    
     echo -e "${B}══════════ 账户信息 ══════════${N}"
     warp-cli registration show 2>/dev/null || echo "未注册"
     echo ""
+    
     echo -e "Socks5 代理: ${G}socks5://127.0.0.1:$PROXY_PORT${N}"
 }
 
@@ -462,7 +587,7 @@ warp_account() {
         1)
             echo -e "${Y}正在切换到免费账户...${N}"
             local was_active=false
-            is_global_active && { was_active=true; clear_global_proxy; }
+            is_global_active && { was_active=true; warp_off >/dev/null 2>&1; }
             
             warp-cli disconnect 2>/dev/null
             warp-cli registration delete 2>/dev/null
@@ -472,7 +597,7 @@ warp_account() {
             warp-cli connect
             sleep 2
             
-            $was_active && setup_global_proxy
+            $was_active && warp_on >/dev/null 2>&1
             echo -e "${G}✓ 已切换到免费账户${N}"
             ;;
         2)
@@ -483,7 +608,7 @@ warp_account() {
             
             echo -e "${Y}正在切换到 WARP+...${N}"
             local was_active=false
-            is_global_active && { was_active=true; clear_global_proxy; }
+            is_global_active && { was_active=true; warp_off >/dev/null 2>&1; }
             
             warp-cli disconnect 2>/dev/null
             warp-cli registration delete 2>/dev/null
@@ -494,7 +619,7 @@ warp_account() {
             warp-cli connect
             sleep 2
             
-            $was_active && setup_global_proxy
+            $was_active && warp_on >/dev/null 2>&1
             echo -e "${G}✓ 已切换到 WARP+${N}"
             ;;
         3)
@@ -523,6 +648,7 @@ warp_account() {
 }
 
 warp_uninstall() {
+    load_config
     echo ""
     echo -e "${R}警告: 即将完全卸载 WARP${N}"
     read -p "确认卸载？(输入 yes): " confirm
@@ -531,7 +657,12 @@ warp_uninstall() {
     
     echo -e "${Y}正在卸载...${N}"
     
-    clear_global_proxy
+    # 关闭全局代理
+    if [[ "$IS_PURE_IPV6" == "true" ]]; then
+        clear_redsocks
+    else
+        clear_tun2socks
+    fi
     
     systemctl stop tun2socks 2>/dev/null
     systemctl disable tun2socks 2>/dev/null
@@ -539,17 +670,19 @@ warp_uninstall() {
     warp-cli disconnect 2>/dev/null
     warp-cli registration delete 2>/dev/null
     
-    apt remove --purge cloudflare-warp -y 2>/dev/null
+    apt remove --purge cloudflare-warp redsocks -y 2>/dev/null
     
     rm -f /etc/apt/sources.list.d/cloudflare-client.list
     rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
     rm -f /etc/systemd/system/tun2socks.service
     rm -f /usr/local/bin/tun2socks
+    rm -f /etc/redsocks.conf
     rm -f "$CONFIG_FILE" "$NETWORK_FILE" "$GLOBAL_MARK"
     rm -f /usr/local/bin/warp /usr/bin/warp
     
     systemctl daemon-reload
-    sed -i '/precedence ::ffff:0:0\/96 100/d' /etc/gai.conf 2>/dev/null
+    sed -i '/precedence ::ff```bash
+ff:0:0/96 100/d' /etc/gai.conf 2>/dev/null
     
     echo -e "${G}✓ 卸载完成${N}"
 }
@@ -586,9 +719,18 @@ show_result() {
     echo -e "${GREEN}         安装完成！${NC}"
     echo -e "${GREEN}════════════════════════════════════════${NC}"
     echo ""
+    
+    if $IS_PURE_IPV6; then
+        echo -e "环境类型: ${YELLOW}纯 IPv6${NC}"
+        echo -e "代理方案: ${YELLOW}redsocks${NC}"
+    else
+        echo -e "环境类型: ${GREEN}IPv4${NC}"
+        echo -e "代理方案: ${GREEN}tun2socks${NC}"
+    fi
+    echo ""
     echo -e "全局代理已自动开启"
     echo ""
-    echo -e "当前出站 IP: ${GREEN}$(curl -4 -s --max-time 10 ifconfig.me --proxy socks5://127.0.0.1:$PROXY_PORT 2>/dev/null || echo '获取中...')${NC}"
+    echo -e "当前出站 IP: ${GREEN}$(curl -4 -s --max-time 10 ifconfig.me 2>/dev/null || echo '获取中...')${NC}"
     echo ""
     echo -e "输入 ${YELLOW}warp${NC} 查看命令菜单"
     echo ""
@@ -607,9 +749,14 @@ main() {
     setup_ipv4_priority
     install_dependencies
     install_warp_cli
-    install_tun2socks
+    
+    if $IS_PURE_IPV6; then
+        install_redsocks
+    else
+        install_tun2socks
+    fi
+    
     configure_warp
-    create_tun2socks_service
     save_network_info
     install_warp_command
     enable_global_proxy
