@@ -20,7 +20,10 @@ log_success() { echo -e "${GREEN}[成功]${NC} $1"; }
 log_error() { echo -e "${RED}[错误]${NC} $1"; }
 
 check_root() {
-    [[ $EUID -ne 0 ]] && { log_error "请使用 root 运行"; exit 1; }
+    if [[ $EUID -ne 0 ]]; then
+        log_error "请使用 root 运行"
+        exit 1
+    fi
 }
 
 setup_ipv4_priority() {
